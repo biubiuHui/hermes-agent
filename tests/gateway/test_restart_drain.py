@@ -32,7 +32,10 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
 
     result = await runner._handle_message(event)
 
-    assert result == "⏳ Draining 1 active agent(s) before restart..."
+    assert "⏳ Draining 1 active agent(s) before restart..." in result
+    assert "/status" in result
+    assert "/agents" in result
+    assert "/stop" in result
     running_agent.interrupt.assert_not_called()
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
@@ -59,6 +62,8 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
     assert adapter._pending_messages[session_key].text == "follow up"
     assert not adapter._active_sessions[session_key].is_set()
     assert any("queued for the next turn" in message for message in adapter.sent)
+    assert any("/status" in message for message in adapter.sent)
+    assert any("/stop" in message for message in adapter.sent)
 
 
 @pytest.mark.asyncio
@@ -76,7 +81,76 @@ async def test_draining_rejects_new_session_messages():
 
     result = await runner._handle_message(event)
 
-    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+    assert "⏳ Gateway is restarting and is not accepting new work right now." in result
+    assert "/status" in result
+    assert "/agents" in result
+
+
+@pytest.mark.asyncio
+async def test_restart_requested_rejects_new_before_drain_starts():
+    runner, _adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._draining = False
+    runner._session_db = None
+
+    event = MessageEvent(
+        text="/new",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m4",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert "Gateway is restarting" in result
+    assert "cannot reset sessions" in result
+    assert "/status" in result
+    runner.session_store.reset_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_status_reports_restart_and_agent_activity():
+    runner, _adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._draining = True
+    runner._session_db = None
+
+    source = make_restart_source()
+    session_key = build_session_key(source)
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=session_key,
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=source.platform,
+        chat_type=source.chat_type,
+    )
+    agent = MagicMock()
+    agent.model = "kimi-coding"
+    agent.get_activity_summary.return_value = {
+        "api_call_count": 2,
+        "max_iterations": 90,
+        "current_tool": None,
+        "last_activity_desc": "waiting for stream response (943s, no chunks yet)",
+        "seconds_since_activity": 943,
+    }
+    runner._running_agents[session_key] = agent
+    runner._running_agents_ts[session_key] = datetime.now().timestamp() - 1000
+
+    event = MessageEvent(
+        text="/status",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m5",
+    )
+
+    result = await runner._handle_status_command(event)
+
+    assert "**Gateway:** restarting" in result
+    assert "**Active Agents:** 1" in result
+    assert "**Agent Model:** `kimi-coding`" in result
+    assert "waiting for stream response" in result
+    assert "943s idle" in result
 
 
 def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
@@ -92,6 +166,19 @@ def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, mon
 
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "interrupt")
     assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+
+
+def test_provider_delay_notice_includes_actionable_commands():
+    runner, _adapter = make_restart_runner()
+
+    message = runner._format_provider_delay_notice(
+        "⚠️ No response from provider for 943s (model: kimi-coding). Reconnecting..."
+    )
+
+    assert "No response from provider" in message
+    assert "/status" in message
+    assert "/agents" in message
+    assert "/stop" in message
 
 
 def test_load_restart_drain_timeout_prefers_env_then_config_then_default(

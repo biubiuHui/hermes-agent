@@ -987,10 +987,8 @@ class GatewayRunner:
         old_session_id: str,
         session_key: Optional[str] = None,
     ):
-        """Run the sync memory flush in a thread pool so it won't block the event loop."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
+        """Run the sync memory flush off-loop without pinning process shutdown."""
+        await self._run_in_executor_with_context(
             self._flush_memories_for_session,
             old_session_id,
             session_key,
@@ -1226,6 +1224,26 @@ class GatewayRunner:
 
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
+
+    def _gateway_wait_hint(self) -> str:
+        if self._restart_requested:
+            return (
+                "Current model/API or tool work is still running. "
+                "Restart will continue after it finishes or the drain timeout expires. "
+                "Use /status or /agents to see what is active, or /stop to cancel it."
+            )
+        return (
+            "Current model/API or tool work is still running. "
+            "Use /status or /agents to see what is active, or /stop to cancel it."
+        )
+
+    def _with_gateway_wait_hint(self, message: str) -> str:
+        return f"{message}\n{self._gateway_wait_hint()}"
+
+    def _format_provider_delay_notice(self, message: str) -> str:
+        if "No response from provider" not in (message or ""):
+            return message
+        return self._with_gateway_wait_hint(message)
 
     def _queue_during_drain_enabled(self) -> bool:
         return self._restart_requested and self._busy_input_mode == "queue"
@@ -1520,9 +1538,13 @@ class GatewayRunner:
             thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = self._with_gateway_wait_hint(
+                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                )
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = self._with_gateway_wait_hint(
+                    f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                )
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -3451,11 +3473,12 @@ class GatewayRunner:
             if self._draining:
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
-                return (
+                message = (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
+                return self._with_gateway_wait_hint(message)
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
@@ -3620,7 +3643,9 @@ class GatewayRunner:
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return self._with_gateway_wait_hint(
+                f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            )
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -4278,9 +4303,7 @@ class GatewayRunner:
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                    loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
-                                        None,
+                                    _compressed, _ = await self._run_in_executor_with_context(
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
@@ -4852,6 +4875,11 @@ class GatewayRunner:
 
     async def _handle_reset_command(self, event: MessageEvent) -> str:
         """Handle /new or /reset command."""
+        if self._restart_requested or self._draining:
+            return self._with_gateway_wait_hint(
+                f"⏳ Gateway is {self._status_action_gerund()} and cannot reset sessions right now."
+            )
+
         source = event.source
         
         # Get existing session key
@@ -4981,7 +5009,16 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        running_agents = getattr(self, "_running_agents", {}) or {}
+        is_running = session_key in running_agents
+        active_count = self._running_agent_count()
+        gateway_state = (
+            "restarting"
+            if self._restart_requested
+            else "shutting down"
+            if self._draining
+            else "running"
+        )
 
         title = None
         if self._session_db:
@@ -4993,6 +5030,8 @@ class GatewayRunner:
         lines = [
             "📊 **Hermes Gateway Status**",
             "",
+            f"**Gateway:** {gateway_state}",
+            f"**Active Agents:** {active_count}",
             f"**Session ID:** `{session_entry.session_id}`",
         ]
         if title:
@@ -5005,6 +5044,33 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
+
+        if is_running:
+            agent = running_agents.get(session_key)
+            started_at = float(self._running_agents_ts.get(session_key, time.time()))
+            elapsed = max(0, int(time.time() - started_at))
+            if agent is _AGENT_PENDING_SENTINEL:
+                lines.append("**Agent State:** starting")
+            else:
+                model = str(getattr(agent, "model", "") or "")
+                if model:
+                    lines.append(f"**Agent Model:** `{model}`")
+                lines.append(f"**Agent Active For:** {elapsed // 60}m {elapsed % 60}s")
+                if hasattr(agent, "get_activity_summary"):
+                    try:
+                        activity = agent.get_activity_summary() or {}
+                        desc = str(activity.get("last_activity_desc") or "unknown")
+                        idle = int(float(activity.get("seconds_since_activity", 0.0) or 0.0))
+                        lines.append(f"**Agent Last Activity:** {desc} ({idle}s idle)")
+                        current_tool = activity.get("current_tool")
+                        if current_tool:
+                            lines.append(f"**Current Tool:** `{current_tool}`")
+                        api_calls = activity.get("api_call_count")
+                        max_iter = activity.get("max_iterations")
+                        if api_calls is not None and max_iter is not None:
+                            lines.append(f"**Iteration:** {api_calls}/{max_iter}")
+                    except Exception:
+                        pass
 
         return "\n".join(lines)
 
@@ -5162,8 +5228,10 @@ class GatewayRunner:
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             if count:
-                return f"⏳ Draining {count} active agent(s) before restart..."
-            return "⏳ Gateway restart already in progress..."
+                return self._with_gateway_wait_hint(
+                    f"⏳ Draining {count} active agent(s) before restart..."
+                )
+            return self._with_gateway_wait_hint("⏳ Gateway restart already in progress...")
 
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
@@ -5210,7 +5278,9 @@ class GatewayRunner:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return f"⏳ Draining {active_agents} active agent(s) before restart..."
+            return self._with_gateway_wait_hint(
+                f"⏳ Draining {active_agents} active agent(s) before restart..."
+            )
         return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
@@ -6989,9 +7059,7 @@ class GatewayRunner:
                 if compress_start >= compress_end:
                     return "Nothing to compress yet (the transcript is still all protected context)."
 
-                loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
+                compressed, _ = await self._run_in_executor_with_context(
                     lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
                 )
 
@@ -7414,8 +7482,6 @@ class GatewayRunner:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
 
-            loop = asyncio.get_running_loop()
-
             def _run_insights():
                 db = SessionDB()
                 engine = InsightsEngine(db)
@@ -7424,14 +7490,13 @@ class GatewayRunner:
                 db.close()
                 return result
 
-            return await loop.run_in_executor(None, _run_insights)
+            return await self._run_in_executor_with_context(_run_insights)
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return f"Error generating insights: {e}"
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
-        loop = asyncio.get_running_loop()
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
@@ -7441,10 +7506,10 @@ class GatewayRunner:
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            await self._run_in_executor_with_context(shutdown_mcp_servers)
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             # Compute what changed
             with _lock:
@@ -7616,14 +7681,11 @@ class GatewayRunner:
         NOT full log files, to protect conversation privacy.  Users who need
         full log uploads should use ``hermes debug share`` from the CLI.
         """
-        import asyncio
         from hermes_cli.debug import (
             _capture_dump, collect_debug_report,
             upload_to_pastebin, _schedule_auto_delete,
             _GATEWAY_PRIVACY_NOTICE,
         )
-
-        loop = asyncio.get_running_loop()
 
         # Run blocking I/O (dump capture, log reads, uploads) in a thread.
         def _collect_and_upload():
@@ -7650,7 +7712,7 @@ class GatewayRunner:
             lines.append("Share these links with the Hermes team for support.")
             return "\n".join(lines)
 
-        return await loop.run_in_executor(None, _collect_and_upload)
+        return await self._run_in_executor_with_context(_collect_and_upload)
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.
@@ -8106,10 +8168,47 @@ class GatewayRunner:
         clear_session_vars(tokens)
 
     async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+        """Run blocking work on a daemon thread while preserving contextvars.
+
+        The gateway must be able to exit after a restart even if a provider
+        call or reset-time memory flush is stuck in blocking I/O.  The default
+        asyncio executor uses non-daemon threads, which can keep the process
+        alive after the async shutdown path has completed.
+        """
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(None, ctx.run, func, *args)
+        future = loop.create_future()
+
+        def _set_result(result):
+            if not future.cancelled():
+                future.set_result(result)
+
+        def _set_exception(exc):
+            if not future.cancelled():
+                future.set_exception(exc)
+
+        def _worker() -> None:
+            try:
+                result = ctx.run(func, *args)
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(_set_exception, exc)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    loop.call_soon_threadsafe(_set_result, result)
+                except RuntimeError:
+                    pass
+
+        name = getattr(func, "__name__", "worker")
+        thread = threading.Thread(
+            target=_worker,
+            name=f"hermes-gateway-{name}",
+            daemon=True,
+        )
+        thread.start()
+        return await future
 
     async def _enrich_message_with_vision(
         self,
@@ -9483,6 +9582,7 @@ class GatewayRunner:
             if not _status_adapter or not _run_still_current():
                 return
             try:
+                message = self._format_provider_delay_notice(message)
                 asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,

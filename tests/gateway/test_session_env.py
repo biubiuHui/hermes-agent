@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 
 import pytest
 
@@ -322,3 +323,31 @@ async def test_run_in_executor_with_context_propagates_exceptions():
 
     with pytest.raises(ValueError, match="boom"):
         await runner._run_in_executor_with_context(blow_up)
+
+
+@pytest.mark.asyncio
+async def test_run_in_executor_with_context_uses_daemon_thread():
+    """Gateway worker threads must not keep the process alive after shutdown."""
+    runner = object.__new__(GatewayRunner)
+
+    is_daemon = await runner._run_in_executor_with_context(
+        lambda: threading.current_thread().daemon
+    )
+
+    assert is_daemon is True
+
+
+@pytest.mark.asyncio
+async def test_async_memory_flush_uses_daemon_thread():
+    """A reset-time memory flush must not block gateway restart process exit."""
+    runner = object.__new__(GatewayRunner)
+    observed = []
+
+    def fake_flush(_old_session_id, _session_key=None):
+        observed.append(threading.current_thread().daemon)
+
+    runner._flush_memories_for_session = fake_flush
+
+    await runner._async_flush_memories("old-session", "session-key")
+
+    assert observed == [True]
