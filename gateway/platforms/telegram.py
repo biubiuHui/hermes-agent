@@ -703,7 +703,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
-            proxy_url = resolve_proxy_url("TELEGRAM_PROXY")
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -714,6 +713,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     ", ".join(fallback_ips),
                 )
 
+            proxy_targets = ["api.telegram.org", *fallback_ips]
+            proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
             if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
@@ -794,8 +795,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Telegram pushes updates to our HTTP endpoint.  This
                 # enables cloud platforms (Fly.io, Railway) to auto-wake
                 # suspended machines on inbound HTTP traffic.
+                #
+                # SECURITY: TELEGRAM_WEBHOOK_SECRET is REQUIRED. Without it,
+                # python-telegram-bot passes secret_token=None and the
+                # webhook endpoint accepts any HTTP POST — attackers can
+                # inject forged updates as if from Telegram. Refuse to
+                # start rather than silently run in fail-open mode.
+                # See GHSA-3vpc-7q5r-276h.
                 webhook_port = int(os.getenv("TELEGRAM_WEBHOOK_PORT", "8443"))
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
+                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                if not webhook_secret:
+                    raise RuntimeError(
+                        "TELEGRAM_WEBHOOK_SECRET is required when "
+                        "TELEGRAM_WEBHOOK_URL is set. Without it, the "
+                        "webhook endpoint accepts forged updates from "
+                        "anyone who can reach it — see "
+                        "https://github.com/NousResearch/hermes-agent/"
+                        "security/advisories/GHSA-3vpc-7q5r-276h.\n\n"
+                        "Generate a secret and set it in your .env:\n"
+                        "  export TELEGRAM_WEBHOOK_SECRET=\"$(openssl rand -hex 32)\"\n\n"
+                        "Then register it with Telegram when setting the "
+                        "webhook via setWebhook's secret_token parameter."
+                    )
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
@@ -1187,6 +1208,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Telegram message.
+
+        Used by the stream consumer's fresh-final cleanup path (ported
+        from openclaw/openclaw#72038) to remove long-lived preview
+        messages after sending the completed reply as a fresh message.
+        Telegram's Bot API ``deleteMessage`` works for bot-posted
+        messages in the last 48 hours.  Failures are non-fatal — the
+        caller leaves the preview in place and logs at debug level.
+        """
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to delete Telegram message %s: %s",
+                self.name, message_id, e,
+            )
+            return False
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
@@ -2306,6 +2352,26 @@ class TelegramAdapter(BasePlatformAdapter):
                 elif entity_type == "text_mention":
                     user = getattr(entity, "user", None)
                     if user and getattr(user, "id", None) == bot_id:
+                        return True
+                elif entity_type == "bot_command" and expected:
+                    # Telegram's official group-disambiguation form for slash
+                    # commands (``/cmd@botname``) is emitted as a single
+                    # ``bot_command`` entity covering the whole span — there
+                    # is no accompanying ``mention`` entity. Treat it as a
+                    # direct address to this bot when the ``@botname`` suffix
+                    # matches. This is the form Telegram's own command menu
+                    # autocomplete produces in groups, so dropping it at the
+                    # mention gate would break /new, /reset, /help, ... for
+                    # every group that has ``require_mention`` enabled (#15415).
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                    if offset < 0 or length <= 0:
+                        continue
+                    command_text = source_text[offset:offset + length]
+                    at_index = command_text.find("@")
+                    if at_index < 0:
+                        continue
+                    if command_text[at_index:].strip().lower() == expected:
                         return True
         return False
 
